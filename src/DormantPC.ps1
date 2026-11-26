@@ -48,6 +48,13 @@ param(
     # agent's last input so it can see what it's doing (-1 = 60 s Night, 0.2 s Power)
     [double]$AgentWindowSeconds = -1,
 
+    # Put the PC to sleep after this many minutes with no mouse/keyboard use by
+    # you or the agent (0 = never sleep while dormant mode runs)
+    [double]$SleepAfterMinutes = 5,
+
+    # Testing: log "would sleep" instead of actually sleeping
+    [switch]$SleepDryRun,
+
     # Stop automatically after this many hours (0 = run until stopped)
     [double]$MaxHours = 0,
 
@@ -78,7 +85,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version  = '1.4.0'
+$Version  = '1.5.0'
 $AppName  = 'Dormant PC with AI'
 $RootDir  = Split-Path -Parent $PSScriptRoot
 $StopFile = Join-Path $env:TEMP 'DormantPC.stop'
@@ -109,6 +116,7 @@ function Write-Log([string]$Message, [string]$Color = 'Gray') {
 # ---------------------------------------------------------------------------
 # Native code (C# 5 so it compiles on stock Windows PowerShell 5.1)
 # ---------------------------------------------------------------------------
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 if (-not ('DormantNative' -as [type])) {
 Add-Type -IgnoreWarnings -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
 using System;
@@ -203,18 +211,43 @@ public static class DormantNative {
     static IntPtr mouseHook, keyHook;
     static uint hookThreadId;
 
-    static long lastPhysical, lastInjected, lastBlank;
+    static long lastPhysical, lastInjected, lastBlank, lastAnyInput;
     public static long PhysicalCount, InjectedCount;
 
+    // Events (screen on/off, errors) for the PowerShell side to write to the log
+    static System.Collections.Concurrent.ConcurrentQueue<string> events = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    static void Ev(string msg) { events.Enqueue(msg); }
+    public static string NextEvent() { string m; return events.TryDequeue(out m) ? m : null; }
+
     static void Record(bool injected) {
-        if (injected) { Interlocked.Exchange(ref lastInjected, Now()); Interlocked.Increment(ref InjectedCount); }
-        else { Interlocked.Exchange(ref lastPhysical, Now()); Interlocked.Increment(ref PhysicalCount); }
+        long t = Now();
+        Interlocked.Exchange(ref lastAnyInput, t);
+        if (injected) { Interlocked.Exchange(ref lastInjected, t); Interlocked.Increment(ref InjectedCount); }
+        else { Interlocked.Exchange(ref lastPhysical, t); Interlocked.Increment(ref PhysicalCount); }
     }
+
+    // Milliseconds since the last mouse/keyboard use by anyone (you or the agent)
+    public static long IdleMs() { return Now() - Interlocked.Read(ref lastAnyInput); }
+
+    // Real mouse movement only counts once it adds up to MoveThresholdPx within
+    // one second, so a bumped desk or a resting hand doesn't wake the screen.
+    // Clicks, the wheel and every key press count immediately.
+    public static int MoveThresholdPx = 40;
+    static long moveWindowStart; static int moveAccum, lastX, lastY; static bool havePoint;
 
     static IntPtr MouseHook(int n, IntPtr w, IntPtr l) {
         if (n >= 0) {
             MSLLHOOKSTRUCT info = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(l, typeof(MSLLHOOKSTRUCT));
-            Record((info.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) != 0);
+            bool injected = (info.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) != 0;
+            if (injected || (long)w != 0x0200) {
+                Record(injected);
+            } else {
+                long t = Now();
+                if (t - moveWindowStart > 1000) { moveWindowStart = t; moveAccum = 0; }
+                if (havePoint) moveAccum += Math.Abs(info.x - lastX) + Math.Abs(info.y - lastY);
+                lastX = info.x; lastY = info.y; havePoint = true;
+                if (moveAccum >= MoveThresholdPx) { moveAccum = 0; Record(false); }
+            }
         }
         return CallNextHookEx(IntPtr.Zero, n, w, l);
     }
@@ -229,7 +262,7 @@ public static class DormantNative {
 
     public static bool StartHooks() {
         if (hookThreadId != 0) return HooksOk();
-        lastPhysical = Now(); lastInjected = 0; lastBlank = Now();
+        lastPhysical = Now(); lastInjected = 0; lastBlank = Now(); lastAnyInput = Now();
         ManualResetEvent ready = new ManualResetEvent(false);
         Thread t = new Thread(delegate() {
             hookThreadId = GetCurrentThreadId();
@@ -567,12 +600,15 @@ public static class DormantNative {
         if (useDim && !dimmed) { Dim(true); dimmed = true; if (usePower) Thread.Sleep(300); }
         if (useDdc) DdcPower(false);
         if (usePower) PowerMessageOff();
+        bool wasOff = screenOff;
         screenOff = true;
         wakeSeenAt = 0; redimStep = 0;
         Interlocked.Exchange(ref lastBlank, Now());
+        if (!wasOff) Ev("Screen dark" + (useOverlay ? " (overlay shown" + (overlayShown ? "" : " - FAILED") + ")" : "") + (useDim ? (dimmed ? ", brightness 0" : "") : ""));
     }
 
     static void ScreenOn() {
+        Ev("You're back - screen on");
         if (useOverlay) HideOverlay();
         if (useDdc) WakeScreens();
         if (useDim && dimmed) {
@@ -604,11 +640,22 @@ public static class DormantNative {
             }
             // agent woke it (Power/Night): let it work for agentWindowMs, then blank again
             if (usePower && inj > blank && (t - inj) > agentWindowMs) ScreenOff();
-        } catch { }
+        } catch (Exception ex) { Ev("Guard error: " + ex.GetType().Name + ": " + ex.Message); }
         finally { Interlocked.Exchange(ref busy, 0); }
     }
 
     public static bool IsScreenOff() { return screenOff; }
+
+    // Before the PC sleeps: stop the guard and put brightness back while the black
+    // overlay still covers the screen, so nothing lights up in a dark room and the
+    // monitor wakes at normal brightness. StopAll afterwards removes the overlay.
+    public static void PrepareForSleep() {
+        if (timer != null) { timer.Dispose(); timer = null; }
+        Thread.Sleep(300);
+        if (useDim && dimmed) {
+            int f = FadeInMs; FadeInMs = 0; Dim(false); FadeInMs = f; dimmed = false;
+        }
+    }
 
     public static void StopAll() {
         if (timer != null) { timer.Dispose(); timer = null; }
@@ -988,15 +1035,24 @@ try {
     [DormantNative]::StartGuard($mode.Ddc, $mode.Power, $mode.Dim, $mode.Overlay, $ReblankAfterMinutes, [int]($win * 1000))
 
     Write-Log ''
-    Write-Log 'DORMANT MODE IS ON. The PC stays awake; screen goes dark in 2 seconds.' Green
-    Write-Log "Your real mouse/keyboard wakes the screen; it goes dark again after $ReblankAfterMinutes min of no use."
+    Write-Log 'DORMANT MODE IS ON. The screen goes dark in 3 seconds - take your hand off the mouse.' Green
+    Write-Log "A real mouse move, click or key press brings the screen back; it goes dark again after $ReblankAfterMinutes min of no use."
+    if ($SleepAfterMinutes -gt 0) { Write-Log "The PC sleeps after $SleepAfterMinutes min with no mouse/keyboard use (by you or the agent)." }
+    else { Write-Log 'Auto-sleep is off: the PC stays awake until you stop dormant mode.' }
     Write-Log 'To end: double-click Wake-DormantPC.bat, or press Enter in this window.'
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 3
     [DormantNative]::MarkAway()
+    $sleepNow = $false
 
     while ($true) {
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 1
         [void][DormantNative]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
+        while (($ev = [DormantNative]::NextEvent()) -ne $null) { Write-Log $ev }
+
+        if ($SleepAfterMinutes -gt 0 -and [DormantNative]::IdleMs() -ge ($SleepAfterMinutes * 60000)) {
+            Write-Log ("No mouse/keyboard use for {0} min - putting the PC to sleep." -f $SleepAfterMinutes)
+            $sleepNow = $true; break
+        }
 
         if (Test-Path $StopFile) { Write-Log 'Stop requested.'; break }
         try {
@@ -1015,7 +1071,21 @@ catch {
     Write-Log "Error: $($_.Exception.Message)" Red
 }
 finally {
+    if ($sleepNow) {
+        [DormantNative]::PrepareForSleep()
+        [void][DormantNative]::SetThreadExecutionState($ES_CONTINUOUS)
+        if ($SleepDryRun) {
+            Write-Log 'SLEEP (dry run): the PC would go to sleep now.'
+            Start-Sleep -Seconds 2
+        } else {
+            Write-Log 'Sleeping...'
+            # Returns after the PC wakes up again
+            [void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)
+            Write-Log 'PC woke up from sleep.'
+        }
+    }
     [DormantNative]::StopAll()
+    while (($ev = [DormantNative]::NextEvent()) -ne $null) { Write-Log $ev }
     [void](Restore-Rgb)
     [void][DormantNative]::SetThreadExecutionState($ES_CONTINUOUS)
     Remove-Item $StopFile, $PidFile, $DimFile -ErrorAction SilentlyContinue
